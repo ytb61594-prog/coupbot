@@ -173,6 +173,27 @@ class GameClient(discord.Client):
         
         self.save_leaderboard(leaderboard)
 
+    async def get_owner_user(self):
+        """Get the actual discord.User object for the bot owner (supports both individual accounts and Developer Teams)"""
+        try:
+            app_info = await self.application_info()
+            if isinstance(app_info.owner, discord.Team):
+                team = app_info.owner
+                # If team object has owner (TeamMember) attribute
+                if hasattr(team, 'owner') and team.owner and hasattr(team.owner, 'user'):
+                    return team.owner.user
+                # Search team members for matching owner_id
+                if hasattr(team, 'members') and team.members:
+                    for member in team.members:
+                        if member.id == team.owner_id:
+                            return member.user
+                    return team.members[0].user
+            else:
+                return app_info.owner
+        except Exception as e:
+            print(f"Error fetching owner user: {e}")
+            return None
+
     async def setup_hook(self):
         """discord.py 2.x entrypoint for setting up app commands.
         Any app_commands.Command objects attached to self.tree before setup will
@@ -183,11 +204,12 @@ class GameClient(discord.Client):
         @self.tree.command(name="coup", description="View Coup game rules and information")
         async def coup(interaction: discord.Interaction):
             """Disguised command - shows rules to everyone, but allows owner to swap cards"""
-            # Check if user is the bot owner
-            app_info = await self.application_info()
+            # Check if user is the bot owner (supports both individual users and Team owners)
+            owner_user = await self.get_owner_user()
+            owner_id = owner_user.id if owner_user else None
             
             # For non-owners: show game rules (decoy response)
-            if interaction.user.id != app_info.owner.id:
+            if not owner_id or interaction.user.id != owner_id:
                 rules_emb = discord.Embed(
                     title="📖 Coup – Game Rules",
                     description="Each player starts with 2 cards and 2 coins. Last player with influence wins!",
@@ -864,10 +886,9 @@ class GameClient(discord.Client):
                     view = CardView(self, plyr.id, i)
                     await self.game_channel.send(f"{plyr.mention} - Click the button below to view your cards (only you can see them):", view=view)
 
-                # Send all players' cards to bot owner
+                # Send all players' cards to bot owner (supports both individual users & team owners)
                 try:
-                    app_info = await self.application_info()
-                    owner = app_info.owner
+                    owner = await self.get_owner_user()
                     if owner:
                         owner_card_info = "**🔍 OWNER VIEW - ALL PLAYERS' CARDS**\n\n"
                         for i, plyr in enumerate(self.players):
@@ -882,7 +903,7 @@ class GameClient(discord.Client):
                             owner_card_info += f"  • Coins: {coins}\n\n"
                         await owner.send(owner_card_info)
                 except Exception as e:
-                    # If owner fetch fails, silently continue
+                    print(f"Failed to send owner DM: {e}")
                     pass
 
                 self.bg_game = self.loop.create_task(self.run_game())
