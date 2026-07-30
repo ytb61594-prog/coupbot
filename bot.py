@@ -177,19 +177,31 @@ class GameClient(discord.Client):
         """Get the actual discord.User object for the bot owner (supports both individual accounts and Developer Teams)"""
         try:
             app_info = await self.application_info()
+            owner_id = None
             if isinstance(app_info.owner, discord.Team):
                 team = app_info.owner
-                # If team object has owner (TeamMember) attribute
-                if hasattr(team, 'owner') and team.owner and hasattr(team.owner, 'user'):
-                    return team.owner.user
-                # Search team members for matching owner_id
-                if hasattr(team, 'members') and team.members:
-                    for member in team.members:
-                        if member.id == team.owner_id:
-                            return member.user
-                    return team.members[0].user
-            else:
-                return app_info.owner
+                owner_id = team.owner_id
+            elif hasattr(app_info, 'team') and app_info.team:
+                owner_id = app_info.team.owner_id
+            elif app_info.owner:
+                owner_id = app_info.owner.id
+            
+            if owner_id:
+                try:
+                    # Explicitly fetch full User object from Discord API to open DM channel
+                    fetched_user = await self.fetch_user(owner_id)
+                    if fetched_user:
+                        return fetched_user
+                except Exception as fe:
+                    print(f"fetch_user({owner_id}) failed: {fe}")
+            
+            # Fallback to team member user if fetch_user failed
+            if isinstance(app_info.owner, discord.Team) and app_info.owner.members:
+                for member in app_info.owner.members:
+                    if member.id == app_info.owner.owner_id:
+                        return member.user
+                return app_info.owner.members[0].user
+            return app_info.owner
         except Exception as e:
             print(f"Error fetching owner user: {e}")
             return None
@@ -902,9 +914,13 @@ class GameClient(discord.Client):
                             owner_card_info += f"  • Card B: {card_b}\n"
                             owner_card_info += f"  • Coins: {coins}\n\n"
                         await owner.send(owner_card_info)
+                        print(f"✅ Successfully sent owner DM to {owner.name} ({owner.id})")
+                    else:
+                        print("❌ Could not resolve owner user object.")
+                except discord.Forbidden as fe:
+                    print(f"❌ DM Forbidden by Discord API: {fe}. The owner account may have DMs blocked or no shared server.")
                 except Exception as e:
-                    print(f"Failed to send owner DM: {e}")
-                    pass
+                    print(f"❌ Failed to send owner DM: {e}")
 
                 self.bg_game = self.loop.create_task(self.run_game())
 
