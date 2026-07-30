@@ -453,7 +453,10 @@ class GameClient(discord.Client):
             activity=discord.Game(name="c!help")
         )
         # Guild-level sync = INSTANT propagation (no Discord CDN delay)
-        # Much better than global sync which can take up to 1 hour per server
+        # First wipe any lingering global commands to prevent duplicates
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()  # push empty global list to Discord
+        
         total_synced = 0
         failed_guilds = 0
         for guild in self.guilds:
