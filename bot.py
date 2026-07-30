@@ -6,6 +6,7 @@ import asyncio
 import math
 import os
 from dotenv import load_dotenv
+from rps_views import RPSChallengeView
 
 # Load environment variables
 load_dotenv()
@@ -90,17 +91,15 @@ class GameClient(discord.Client):
             winner = self.game_inst.alive[0]
             winner_name = winner.name
             
-            # Find winner's Discord user ID
+            # Find winner's Discord user ID by checking self.players and self.all_original_players
             winner_id = None
-            for player in self.players:
+            for player in list(self.players) + list(self.all_original_players):
                 if player.name == winner_name:
                     winner_id = player.id
                     break
             
             # Update leaderboard if we have a valid guild and winner
-            # Use all_original_players instead of self.players since eliminated players are removed from self.players
             if self.game_channel and hasattr(self.game_channel, 'guild') and self.game_channel.guild and winner_id:
-                # Debug logging removed for production
                 all_player_ids = [p.id for p in self.all_original_players]
                 self.update_leaderboard(self.game_channel.guild.id, winner_id, all_player_ids)
             
@@ -149,29 +148,88 @@ class GameClient(discord.Client):
             json.dump(leaderboard_data, f, indent=2)
     
     def update_leaderboard(self, guild_id, winner_id, all_player_ids):
-        """Update leaderboard: winner gets a win, others get a loss"""
+        """Update leaderboard: winner gets a win, others get a loss (deduplicated)"""
         leaderboard = self.load_leaderboard()
+        str_guild_id = str(guild_id)
         
-        if str(guild_id) not in leaderboard:
-            leaderboard[str(guild_id)] = {}
+        if str_guild_id not in leaderboard:
+            leaderboard[str_guild_id] = {}
         
-        guild_leaderboard = leaderboard[str(guild_id)]
+        guild_leaderboard = leaderboard[str_guild_id]
         
         # Add win for winner
-        if str(winner_id) not in guild_leaderboard:
-            guild_leaderboard[str(winner_id)] = {"wins": 0, "losses": 0}
-        guild_leaderboard[str(winner_id)]["wins"] += 1
+        str_winner_id = str(winner_id)
+        if str_winner_id not in guild_leaderboard:
+            guild_leaderboard[str_winner_id] = {"wins": 0, "losses": 0}
+        guild_leaderboard[str_winner_id]["wins"] = guild_leaderboard[str_winner_id].get("wins", 0) + 1
         
-        # Add loss for all other players
-        losses_added = 0
-        for player_id in all_player_ids:
+        # Add loss for all other unique players
+        unique_player_ids = set(all_player_ids)
+        for player_id in unique_player_ids:
             if player_id != winner_id:
-                if str(player_id) not in guild_leaderboard:
-                    guild_leaderboard[str(player_id)] = {"wins": 0, "losses": 0}
-                guild_leaderboard[str(player_id)]["losses"] += 1
-                losses_added += 1
+                str_pid = str(player_id)
+                if str_pid not in guild_leaderboard:
+                    guild_leaderboard[str_pid] = {"wins": 0, "losses": 0}
+                guild_leaderboard[str_pid]["losses"] = guild_leaderboard[str_pid].get("losses", 0) + 1
         
         self.save_leaderboard(leaderboard)
+
+    async def get_leaderboard_embed(self, guild_id: int):
+        """Build and return leaderboard embed for a guild"""
+        leaderboard = self.load_leaderboard()
+        str_guild_id = str(guild_id)
+        
+        if str_guild_id not in leaderboard or not leaderboard[str_guild_id]:
+            return discord.Embed(
+                title="📊 Coup Leaderboard",
+                description="No games have been recorded in this server yet.\n\nPlay some games to see stats here!",
+                color=COLOR_INFO
+            )
+        
+        guild_lb = leaderboard[str_guild_id]
+        
+        # Sort by wins (descending), then win rate (descending), then total games (descending)
+        def sort_key(item):
+            stats = item[1]
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            total = wins + losses
+            win_rate = (wins / total) if total > 0 else 0
+            return (wins, win_rate, total)
+        
+        sorted_players = sorted(guild_lb.items(), key=sort_key, reverse=True)
+        
+        lb_emb = discord.Embed(
+            title="🏆 Coup Leaderboard",
+            description="Top players in this server ranked by wins",
+            color=COLOR_GOLD
+        )
+        
+        lb_text = ""
+        medals = ["🥇", "🥈", "🥉"]
+        
+        for idx, (user_id_str, stats) in enumerate(sorted_players[:10]):
+            uid = int(user_id_str)
+            user = self.get_user(uid)
+            if not user:
+                try:
+                    user = await self.fetch_user(uid)
+                except Exception:
+                    user = None
+            
+            username = user.display_name if user else f"User {user_id_str}"
+            medal = medals[idx] if idx < 3 else f"**{idx + 1}.**"
+            wins = stats.get("wins", 0)
+            losses = stats.get("losses", 0)
+            total = wins + losses
+            win_rate = (wins / total * 100) if total > 0 else 0.0
+            
+            lb_text += f"{medal} **{username}**\n"
+            lb_text += f"   W: **{wins}** • L: **{losses}** • WR: **{win_rate:.1f}%**\n\n"
+        
+        lb_emb.add_field(name="Players", value=lb_text or "No players recorded yet.", inline=False)
+        lb_emb.set_footer(text="Complete a full game to record results.")
+        return lb_emb
 
     async def get_owner_user(self):
         """Get the actual discord.User object for the bot owner (supports both individual accounts and Developer Teams)"""
@@ -340,6 +398,41 @@ class GameClient(discord.Client):
             
             await interaction.response.send_message(embed=embed, view=swap_view, ephemeral=True)
         
+        # Register Rock Paper Scissors slash command
+        @self.tree.command(name="rps", description="Challenge another user to a game of Rock, Paper, Scissors")
+        @app_commands.describe(opponent="The player you want to challenge (optional)")
+        async def rps_slash(interaction: discord.Interaction, opponent: discord.User = None):
+            """Slash command to challenge another user or open an RPS challenge"""
+            if opponent and opponent.bot:
+                await interaction.response.send_message("❌ You cannot challenge a bot!", ephemeral=True)
+                return
+            if opponent and opponent.id == interaction.user.id:
+                await interaction.response.send_message("❌ You cannot challenge yourself!", ephemeral=True)
+                return
+
+            challenge_view = RPSChallengeView(self, interaction.user, opponent)
+            target_text = f"**{opponent.mention}**" if opponent else "anyone in this channel"
+            embed = discord.Embed(
+                title="🎮 Rock, Paper, Scissors Challenge!",
+                description=f"**{interaction.user.mention}** has issued an RPS challenge to {target_text}!\n\nClick **Accept Challenge** to play!",
+                color=COLOR_INFO
+            )
+            embed.set_footer(text="Rock Paper Scissors • Quick & Clean")
+            await interaction.response.send_message(embed=embed, view=challenge_view)
+            msg = await interaction.original_response()
+            challenge_view.message = msg
+
+        # Register Leaderboard slash command
+        @self.tree.command(name="leaderboard", description="View this server's Coup leaderboard")
+        async def leaderboard_slash(interaction: discord.Interaction):
+            """Slash command to view server leaderboard"""
+            if not interaction.guild:
+                await interaction.response.send_message("❌ Leaderboard can only be viewed in a server channel!", ephemeral=True)
+                return
+            
+            embed = await self.get_leaderboard_embed(interaction.guild.id)
+            await interaction.response.send_message(embed=embed)
+
         return
 
     async def on_ready(self):
@@ -531,8 +624,36 @@ class GameClient(discord.Client):
                 ),
                 inline=False
             )
+            help_emb.add_field(
+                name="🎮 Mini Games",
+                value=(
+                    "**c!rps [@user]** or **/rps** – Challenge another player to Rock, Paper, Scissors!"
+                ),
+                inline=False
+            )
             help_emb.set_footer(text="Host with c!start • Join with ✅ • Begin with ▶️")
             await message.channel.send(embed=help_emb)
+            return
+
+        if message.content.lower().startswith('c!rps'):
+            opponent = message.mentions[0] if message.mentions else None
+            if opponent and opponent.bot:
+                await message.channel.send("❌ You cannot challenge a bot!")
+                return
+            if opponent and opponent.id == message.author.id:
+                await message.channel.send("❌ You cannot challenge yourself!")
+                return
+
+            challenge_view = RPSChallengeView(self, message.author, opponent)
+            target_text = f"**{opponent.mention}**" if opponent else "anyone in this channel"
+            embed = discord.Embed(
+                title="🎮 Rock, Paper, Scissors Challenge!",
+                description=f"**{message.author.mention}** has issued an RPS challenge to {target_text}!\n\nClick **Accept Challenge** to play!",
+                color=COLOR_INFO
+            )
+            embed.set_footer(text="Rock Paper Scissors • Quick & Clean")
+            msg = await message.channel.send(embed=embed, view=challenge_view)
+            challenge_view.message = msg
             return
 
         if message.content.lower() == 'c!rules':
@@ -605,67 +726,17 @@ class GameClient(discord.Client):
                 await message.author.send(embed=embed)
             return
 
-        if message.content.lower() == 'c!leaderboard' or message.content.lower() == 'c!lb':
-            if not isinstance(message.channel, discord.DMChannel):
-                guild_id = str(message.guild.id)
-                leaderboard = self.load_leaderboard()
-                
-                if guild_id not in leaderboard or not leaderboard[guild_id]:
-                    await message.channel.send(embed=discord.Embed(
-                        title="📊 Coup Leaderboard",
-                        description="No games have been recorded in this server yet.\n\nPlay some games to see stats here!",
-                        color=COLOR_INFO
-                    ))
-                    return
-                
-                guild_lb = leaderboard[guild_id]
-                
-                # Sort by wins (descending), then by total games (descending)
-                sorted_players = sorted(
-                    guild_lb.items(),
-                    key=lambda x: (x[1]["wins"], x[1]["wins"] + x[1]["losses"]),
-                    reverse=True
-                )
-                
-                # Build leaderboard embed
-                lb_emb = discord.Embed(
-                    title="🏆 Coup Leaderboard",
-                    description="Top players in this server ranked by wins",
-                    color=COLOR_GOLD
-                )
-                
-                lb_text = ""
-                medals = ["🥇", "🥈", "🥉"]
-                
-                for idx, (user_id, stats) in enumerate(sorted_players[:10]):  # Top 10
-                    try:
-                        user = await client.fetch_user(int(user_id))
-                        username = user.name
-                    except:
-                        username = f"User {user_id}"
-                    
-                    medal = medals[idx] if idx < 3 else f"**{idx + 1}.**"
-                    wins = stats["wins"]
-                    losses = stats["losses"]
-                    total = wins + losses
-                    win_rate = (wins / total * 100) if total > 0 else 0
-                    
-                    lb_text += f"{medal} **{username}**\n"
-                    lb_text += f"   W: **{wins}** • L: **{losses}** • WR: **{win_rate:.1f}%**\n\n"
-                
-                if not lb_text:
-                    lb_text = "No players yet!"
-                
-                lb_emb.add_field(name="Players", value=lb_text, inline=False)
-                lb_emb.set_footer(text="Complete a full game to record results.")
-                
-                await message.channel.send(embed=lb_emb)
+        if message.content.lower() in ('c!leaderboard', 'c!lb'):
+            if not isinstance(message.channel, discord.DMChannel) and message.guild:
+                embed = await self.get_leaderboard_embed(message.guild.id)
+                await message.channel.send(embed=embed)
             else:
                 await message.channel.send(embed=discord.Embed(
                     title="❌ Command Not Available",
                     description="Leaderboard can only be viewed in a server channel!",
                     color=COLOR_WARNING
                 ))
+            return
 
         if message.content.lower() == 'stop chicken coop' or message.content.lower() == 'c!stop' or message.content.lower() == 'c!end':
             if not self.game_running:
