@@ -452,11 +452,20 @@ class GameClient(discord.Client):
         await client.change_presence(
             activity=discord.Game(name="c!help")
         )
-        # Guild-level sync = INSTANT propagation (no Discord CDN delay)
-        # First wipe any lingering global commands to prevent duplicates
-        self.tree.clear_commands(guild=None)
-        await self.tree.sync()  # push empty global list to Discord
         
+        # ── SLASH COMMAND SYNC ──────────────────────────────────────────
+        # Strategy: guild-level sync for INSTANT availability.
+        # 
+        # Step 1: Copy global commands → each guild, then sync per guild.
+        #         (commands are still in the tree at this point)
+        # Step 2: Wipe global commands from Discord's API so they don't
+        #         appear alongside the identical guild copies (= duplicates).
+        # Step 3: Re-add commands to the in-memory tree so reconnects
+        #         and on_guild_join can still use them.
+        # ────────────────────────────────────────────────────────────────
+        
+        # Step 1: Push to every guild while tree still has commands
+        saved_commands = list(self.tree.get_commands())
         total_synced = 0
         failed_guilds = 0
         for guild in self.guilds:
@@ -464,12 +473,38 @@ class GameClient(discord.Client):
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 total_synced += len(synced)
-                print(f"[{guild.name}] Synced {len(synced)} command(s)")
+                print(f"[SYNC] [{guild.name}] {len(synced)} command(s)")
             except Exception as e:
                 failed_guilds += 1
-                print(f"[{guild.name}] Sync failed: {e}")
-        print(f"Done. {total_synced} command slots synced across {len(self.guilds) - failed_guilds}/{len(self.guilds)} guilds.")
+                print(f"[SYNC] [{guild.name}] FAILED: {e}")
+        
+        # Step 2: Clear global from Discord API to kill duplicates
+        self.tree.clear_commands(guild=None)
+        try:
+            await self.tree.sync()
+            print("[SYNC] Global commands cleared from Discord API")
+        except Exception as e:
+            print(f"[SYNC] Global clear failed (non-critical): {e}")
+        
+        # Step 3: Restore commands to in-memory tree for future use
+        for cmd in saved_commands:
+            try:
+                self.tree.add_command(cmd)
+            except Exception:
+                pass  # already exists (shouldn't happen, but safe)
+        
+        ok_count = len(self.guilds) - failed_guilds
+        print(f"[SYNC] Done. {ok_count}/{len(self.guilds)} guilds synced, {total_synced} command slots total.")
     
+    async def on_guild_join(self, guild):
+        """When bot is added to a new server, instantly sync slash commands"""
+        try:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"[SYNC] New guild [{guild.name}] — {len(synced)} command(s) synced")
+        except Exception as e:
+            print(f"[SYNC] New guild [{guild.name}] sync failed: {e}")
+
     # Button interactions are handled directly in View callbacks (discord.py 2.x)
     # No need for on_interaction handler - button callbacks handle everything
             
