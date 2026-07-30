@@ -452,15 +452,20 @@ class GameClient(discord.Client):
         await client.change_presence(
             activity=discord.Game(name="c!help")
         )
-        # Sync slash commands - this will remove commands not in code (like old /challenge)
-        try:
-            synced = await self.tree.sync()
-            print(f"Synced {len(synced)} command(s)")
-            # List synced commands for verification
-            if synced:
-                print(f"Registered commands: {[cmd.name for cmd in synced]}")
-        except Exception as e:
-            print(f"Failed to sync commands: {e}")
+        # Guild-level sync = INSTANT propagation (no Discord CDN delay)
+        # Much better than global sync which can take up to 1 hour per server
+        total_synced = 0
+        failed_guilds = 0
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                total_synced += len(synced)
+                print(f"[{guild.name}] Synced {len(synced)} command(s)")
+            except Exception as e:
+                failed_guilds += 1
+                print(f"[{guild.name}] Sync failed: {e}")
+        print(f"Done. {total_synced} command slots synced across {len(self.guilds) - failed_guilds}/{len(self.guilds)} guilds.")
     
     # Button interactions are handled directly in View callbacks (discord.py 2.x)
     # No need for on_interaction handler - button callbacks handle everything
