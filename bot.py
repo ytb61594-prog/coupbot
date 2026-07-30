@@ -6,7 +6,7 @@ import asyncio
 import math
 import os
 from dotenv import load_dotenv
-from rps_views import RPSChallengeView
+from rps_views import RPSChallengeView, get_rps_leaderboard_embed
 
 # Load environment variables
 load_dotenv()
@@ -433,6 +433,17 @@ class GameClient(discord.Client):
             embed = await self.get_leaderboard_embed(interaction.guild.id)
             await interaction.response.send_message(embed=embed)
 
+        # Register RPS Leaderboard slash command
+        @self.tree.command(name="rpsleaderboard", description="View this server's Rock Paper Scissors ELO leaderboard")
+        async def rps_leaderboard_slash(interaction: discord.Interaction):
+            """Slash command to view RPS leaderboard"""
+            if not interaction.guild:
+                await interaction.response.send_message("❌ RPS Leaderboard can only be viewed in a server channel!", ephemeral=True)
+                return
+            
+            embed = await get_rps_leaderboard_embed(self, interaction.guild.id)
+            await interaction.response.send_message(embed=embed)
+
         return
 
     async def on_ready(self):
@@ -625,14 +636,27 @@ class GameClient(discord.Client):
                 inline=False
             )
             help_emb.add_field(
-                name="🎮 Mini Games",
+                name="🎮 Mini Games (Rock Paper Scissors)",
                 value=(
-                    "**c!rps [@user]** or **/rps** – Challenge another player to Rock, Paper, Scissors!"
+                    "**c!rps [@user]** or **/rps** – Challenge another player to Rock, Paper, Scissors!\n"
+                    "**c!rpslb** or **/rpsleaderboard** – View server RPS ELO ratings and standings."
                 ),
                 inline=False
             )
             help_emb.set_footer(text="Host with c!start • Join with ✅ • Begin with ▶️")
             await message.channel.send(embed=help_emb)
+            return
+
+        if message.content.lower() in ('c!rpslb', 'c!rpsleaderboard'):
+            if not isinstance(message.channel, discord.DMChannel) and message.guild:
+                embed = await get_rps_leaderboard_embed(self, message.guild.id)
+                await message.channel.send(embed=embed)
+            else:
+                await message.channel.send(embed=discord.Embed(
+                    title="❌ Command Not Available",
+                    description="RPS Leaderboard can only be viewed in a server channel!",
+                    color=COLOR_WARNING
+                ))
             return
 
         if message.content.lower().startswith('c!rps'):
