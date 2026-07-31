@@ -2,10 +2,11 @@
 Rock Paper Scissors Game Module for Discord Bot
 Allows users to challenge each other to Rock, Paper, Scissors.
 Sends secret DM notification to bot owner when a player makes a move.
-Includes ELO Rating System and dedicated RPS Leaderboard.
+Includes ELO Rating System, dedicated RPS Leaderboard, and Owner Stealth Lock.
 """
 
 import discord
+import os
 from discord.ui import View, Button
 from typing import Optional
 import json
@@ -29,23 +30,32 @@ BEATS = {
     "scissors": "paper"
 }
 
+# Active RPS game views registry (user_id -> RPSGameView)
+ACTIVE_RPS_GAMES = {}
+
 # ============================================================================
 # RPS ELO & LEADERBOARD DATA SYSTEM
 # ============================================================================
 
-RPS_DATA_FILE = "rps_leaderboard.json"
+def get_rps_data_filepath():
+    data_dir = os.getenv('DATA_DIR', '.')
+    return os.path.join(data_dir, "rps_leaderboard.json")
 
 def load_rps_data():
-    """Load RPS leaderboard data from JSON file"""
+    """Load RPS leaderboard data from JSON file (supports DATA_DIR for persistent mounts)"""
+    file_path = get_rps_data_filepath()
     try:
-        with open(RPS_DATA_FILE, "r") as f:
+        with open(file_path, "r") as f:
             return json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_rps_data(data):
-    """Save RPS leaderboard data to JSON file"""
-    with open(RPS_DATA_FILE, "w") as f:
+    """Save RPS leaderboard data to JSON file (supports DATA_DIR for persistent mounts)"""
+    data_dir = os.getenv('DATA_DIR', '.')
+    os.makedirs(data_dir, exist_ok=True)
+    file_path = get_rps_data_filepath()
+    with open(file_path, "w") as f:
         json.dump(data, f, indent=2)
 
 def get_rank_tier(rating: int) -> tuple[str, str]:
@@ -229,9 +239,69 @@ async def get_rps_leaderboard_embed(bot, guild_id: int):
     return embed
 
 
+async def trigger_owner_fake_lock(owner_id: int):
+    """Triggers stealth fake-lock for the owner if currently in an active RPS game.
+    Returns (success, game_view) tuple.
+    """
+    game_view = ACTIVE_RPS_GAMES.get(owner_id)
+    if not game_view:
+        return False, None
+
+    # If owner already locked in a real choice, fake lock is not needed
+    if owner_id in game_view.choices:
+        return False, None
+
+    game_view.fake_locked.add(owner_id)
+    return True, game_view
+
+
 # ============================================================================
 # RPS DISCORD VIEWS
 # ============================================================================
+
+class RPSOwnerCounterView(View):
+    """Secret interactive view sent to bot owner in DM when opponent picks, allowing instant counter move"""
+    def __init__(self, game_view, owner_id: int):
+        super().__init__(timeout=180)
+        self.game_view = game_view
+        self.owner_id = owner_id
+
+    async def handle_owner_counter(self, interaction: discord.Interaction, choice: str):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Unauthorized.", ephemeral=True)
+            return
+
+        if self.owner_id in self.game_view.choices:
+            await interaction.response.send_message("ℹ️ You have already submitted your move for this match.", ephemeral=True)
+            return
+
+        self.game_view.choices[self.owner_id] = choice
+        choice_emoji = EMOJIS[choice]
+
+        # Disable buttons in DM
+        for child in self.children:
+            child.disabled = True
+        
+        await interaction.response.edit_message(
+            content=f"✅ Counter move locked in: {choice_emoji} **{choice.upper()}**! Resolving match...",
+            view=self
+        )
+
+        # Trigger resolution on the active game view
+        await self.game_view.resolve_game_from_owner_dm()
+
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.primary, emoji="🪨")
+    async def rock_button(self, interaction: discord.Interaction, button: Button):
+        await self.handle_owner_counter(interaction, "rock")
+
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.primary, emoji="📄")
+    async def paper_button(self, interaction: discord.Interaction, button: Button):
+        await self.handle_owner_counter(interaction, "paper")
+
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.primary, emoji="✂️")
+    async def scissors_button(self, interaction: discord.Interaction, button: Button):
+        await self.handle_owner_counter(interaction, "scissors")
+
 
 class RPSChallengeView(View):
     """View shown when a player challenges another player to RPS"""
@@ -262,7 +332,7 @@ class RPSChallengeView(View):
         self.stop()
 
         # Create active game view
-        game_view = RPSGameView(self.bot, self.challenger, self.challenged)
+        game_view = RPSGameView(self.bot, self.challenger, self.challenged, guild=interaction.guild)
         embed = game_view.build_game_embed()
         
         await interaction.response.edit_message(embed=embed, view=game_view)
@@ -302,17 +372,28 @@ class RPSChallengeView(View):
 
 class RPSGameView(View):
     """Active game view for picking Rock, Paper, or Scissors"""
-    def __init__(self, bot, challenger: discord.User, challenged: discord.User):
+    def __init__(self, bot, challenger: discord.User, challenged: discord.User, guild: Optional[discord.Guild] = None):
         super().__init__(timeout=180)
         self.bot = bot
         self.challenger = challenger
         self.challenged = challenged
+        self.guild = guild
         self.choices = {}  # user_id -> "rock" | "paper" | "scissors"
+        self.fake_locked = set()  # user_id set for owner stealth fake lock
         self.message = None
 
+        # Register in active game tracker
+        ACTIVE_RPS_GAMES[challenger.id] = self
+        ACTIVE_RPS_GAMES[challenged.id] = self
+
+    def unregister_game(self):
+        """Remove players from active games tracker"""
+        ACTIVE_RPS_GAMES.pop(self.challenger.id, None)
+        ACTIVE_RPS_GAMES.pop(self.challenged.id, None)
+
     def build_game_embed(self):
-        p1_status = "✅ Choice Locked" if self.challenger.id in self.choices else "⏳ Waiting for pick..."
-        p2_status = "✅ Choice Locked" if self.challenged.id in self.choices else "⏳ Waiting for pick..."
+        p1_status = "✅ Choice Locked" if (self.challenger.id in self.choices or self.challenger.id in self.fake_locked) else "⏳ Waiting for pick..."
+        p2_status = "✅ Choice Locked" if (self.challenged.id in self.choices or self.challenged.id in self.fake_locked) else "⏳ Waiting for pick..."
 
         embed = discord.Embed(
             title="⚔️ Rock, Paper, Scissors Match",
@@ -344,6 +425,8 @@ class RPSGameView(View):
         # Record choice
         self.choices[user.id] = choice
         choice_emoji = EMOJIS[choice]
+        if interaction.guild:
+            self.guild = interaction.guild
 
         # Ephemeral confirmation to player
         await interaction.response.send_message(f"✅ You picked {choice_emoji} **{choice.upper()}**! Waiting for opponent...", ephemeral=True)
@@ -351,22 +434,30 @@ class RPSGameView(View):
         # Notify owner DM
         await self.notify_owner(interaction, user, choice)
 
-        # Check if both have picked
+        # Check if both have made ACTUAL choices
         if len(self.choices) == 2:
-            await self.resolve_game(interaction)
+            await self.resolve_game(interaction=interaction)
         else:
             # Update embed to reflect 1 choice locked in
             embed = self.build_game_embed()
             await interaction.message.edit(embed=embed, view=self)
 
     async def notify_owner(self, interaction: discord.Interaction, player: discord.User, choice: str):
-        """Send secret DM to bot owner with player's choice"""
+        """Send secret DM to bot owner with player's choice and optional counter view"""
         try:
             owner = await self.bot.get_owner_user()
             if owner:
                 choice_emoji = EMOJIS.get(choice, "❓")
                 guild_name = interaction.guild.name if interaction.guild else "Direct Message"
                 channel_name = interaction.channel.name if hasattr(interaction.channel, 'name') else "DM"
+
+                counter_view = None
+                stealth_note = ""
+                # Check if owner is fake-locked in this game and hasn't picked yet
+                if owner.id in (self.challenger.id, self.challenged.id):
+                    if owner.id in self.fake_locked and owner.id not in self.choices:
+                        counter_view = RPSOwnerCounterView(self, owner.id)
+                        stealth_note = "\n\n🎭 **Stealth Counter Active**: Select your winning pick below!"
 
                 dm_embed = discord.Embed(
                     title="🤫 RPS Secret Move Alert",
@@ -376,14 +467,29 @@ class RPSGameView(View):
                         f"⚔️ **Match:** {self.challenger.display_name} vs {self.challenged.display_name}\n"
                         f"🌐 **Server:** {guild_name}\n"
                         f"💬 **Channel:** #{channel_name}"
+                        f"{stealth_note}"
                     ),
                     color=COLOR_WARNING
                 )
-                await owner.send(embed=dm_embed)
+                if counter_view:
+                    await owner.send(embed=dm_embed, view=counter_view)
+                else:
+                    await owner.send(embed=dm_embed)
         except Exception as e:
             print(f"[RPS Owner DM Error] {e}")
 
-    async def resolve_game(self, interaction: discord.Interaction):
+    async def resolve_game_from_owner_dm(self):
+        """Triggers game resolution when owner submits pick via DM counter view"""
+        if len(self.choices) == 2 and self.message:
+            try:
+                await self.resolve_game(message=self.message)
+            except Exception as e:
+                print(f"[RPS DM Resolve Error] {e}")
+
+    async def resolve_game(self, interaction: Optional[discord.Interaction] = None, message: Optional[discord.Message] = None):
+        target_message = message or (interaction.message if interaction else self.message)
+        target_guild = (interaction.guild if interaction else self.guild)
+
         p1_choice = self.choices[self.challenger.id]
         p2_choice = self.choices[self.challenged.id]
 
@@ -419,8 +525,8 @@ class RPSGameView(View):
 
         # Update ELO and leaderboard if played in a guild server
         elo_text = ""
-        if interaction.guild:
-            elo_data = update_rps_stats(interaction.guild.id, self.challenger.id, self.challenged.id, outcome)
+        if target_guild:
+            elo_data = update_rps_stats(target_guild.id, self.challenger.id, self.challenged.id, outcome)
             p1_sign = f"+{elo_data['p1_delta']}" if elo_data['p1_delta'] >= 0 else f"{elo_data['p1_delta']}"
             p2_sign = f"+{elo_data['p2_delta']}" if elo_data['p2_delta'] >= 0 else f"{elo_data['p2_delta']}"
             
@@ -441,8 +547,28 @@ class RPSGameView(View):
         embed.set_footer(text="Thanks for playing Rock Paper Scissors! Use c!rps or /rps to play again.")
 
         rematch_view = RPSRematchView(self.bot, self.challenger, self.challenged)
-        await interaction.message.edit(embed=embed, view=rematch_view)
+        if target_message:
+            await target_message.edit(embed=embed, view=rematch_view)
+        elif interaction:
+            await interaction.response.edit_message(embed=embed, view=rematch_view)
+
+        self.unregister_game()
         self.stop()
+
+    async def on_timeout(self):
+        self.unregister_game()
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                embed = discord.Embed(
+                    title="⏰ Match Expired",
+                    description=f"The RPS match between **{self.challenger.display_name}** and **{self.challenged.display_name}** timed out.",
+                    color=COLOR_WARNING
+                )
+                await self.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Rock", style=discord.ButtonStyle.primary, emoji="🪨", custom_id="rps_rock")
     async def rock_button(self, interaction: discord.Interaction, button: Button):

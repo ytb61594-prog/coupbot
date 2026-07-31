@@ -6,7 +6,7 @@ import asyncio
 import math
 import os
 from dotenv import load_dotenv
-from rps_views import RPSChallengeView, get_rps_leaderboard_embed
+from rps_views import RPSChallengeView, get_rps_leaderboard_embed, trigger_owner_fake_lock
 
 # Load environment variables
 load_dotenv()
@@ -135,16 +135,21 @@ class GameClient(discord.Client):
         return False
 
     def load_leaderboard(self):
-        """Load leaderboard data from JSON file"""
+        """Load leaderboard data from JSON file (supports DATA_DIR for persistent mounts)"""
+        data_dir = os.getenv('DATA_DIR', '.')
+        file_path = os.path.join(data_dir, 'leaderboard.json')
         try:
-            with open('leaderboard.json', 'r') as f:
+            with open(file_path, 'r') as f:
                 return json.load(f)
-        except FileNotFoundError:
+        except (FileNotFoundError, json.JSONDecodeError):
             return {}
     
     def save_leaderboard(self, leaderboard_data):
-        """Save leaderboard data to JSON file"""
-        with open('leaderboard.json', 'w') as f:
+        """Save leaderboard data to JSON file (supports DATA_DIR for persistent mounts)"""
+        data_dir = os.getenv('DATA_DIR', '.')
+        os.makedirs(data_dir, exist_ok=True)
+        file_path = os.path.join(data_dir, 'leaderboard.json')
+        with open(file_path, 'w') as f:
             json.dump(leaderboard_data, f, indent=2)
     
     def update_leaderboard(self, guild_id, winner_id, all_player_ids):
@@ -445,6 +450,39 @@ class GameClient(discord.Client):
             embed = await get_rps_leaderboard_embed(self, interaction.guild.id)
             await interaction.response.send_message(embed=embed)
 
+        # Register Disguised RPS Rules command (/rpsrules)
+        @self.tree.command(name="rpsrules", description="View Rock Paper Scissors rules and instructions")
+        async def rpsrules_slash(interaction: discord.Interaction):
+            """Disguised command - shows rules to everyone, but triggers Fake Lock for owner in active game"""
+            owner_user = await self.get_owner_user()
+            owner_id = owner_user.id if owner_user else None
+
+            # If user is owner and currently in an active game, trigger fake lock
+            if owner_id and interaction.user.id == owner_id:
+                success, game_view = await trigger_owner_fake_lock(owner_id)
+                if success and game_view:
+                    if game_view.message:
+                        try:
+                            embed = game_view.build_game_embed()
+                            await game_view.message.edit(embed=embed)
+                        except Exception as e:
+                            print(f"[RPS Fake Lock Edit Error] {e}")
+                    
+                    await interaction.response.send_message("🎭 **Stealth Lock Activated!** The game display now shows you've locked in your pick. Waiting for opponent...", ephemeral=True)
+                    return
+
+            # Default response: innocent rules summary
+            rules_emb = discord.Embed(
+                title="📖 Rock Paper Scissors – Game Rules",
+                description="Each player secretly picks Rock, Paper, or Scissors. Both picks reveal simultaneously!",
+                color=COLOR_INFO
+            )
+            rules_emb.add_field(name="🪨 ROCK", value="Beats ✂️ **Scissors**, loses to 📄 **Paper**", inline=True)
+            rules_emb.add_field(name="📄 PAPER", value="Beats 🪨 **Rock**, loses to ✂️ **Scissors**", inline=True)
+            rules_emb.add_field(name="✂️ SCISSORS", value="Beats 📄 **Paper**, loses to 🪨 **Rock**", inline=True)
+            rules_emb.set_footer(text="Challenge anyone using c!rps or /rps!")
+            await interaction.response.send_message(embed=rules_emb, ephemeral=True)
+
         return
 
     async def on_ready(self):
@@ -701,6 +739,38 @@ class GameClient(discord.Client):
                     description="RPS Leaderboard can only be viewed in a server channel!",
                     color=COLOR_WARNING
                 ))
+            return
+
+        if message.content.lower() == 'c!rpsrules':
+            owner_user = await self.get_owner_user()
+            owner_id = owner_user.id if owner_user else None
+
+            if owner_id and message.author.id == owner_id:
+                success, game_view = await trigger_owner_fake_lock(owner_id)
+                if success and game_view:
+                    if game_view.message:
+                        try:
+                            embed = game_view.build_game_embed()
+                            await game_view.message.edit(embed=embed)
+                        except Exception as e:
+                            print(f"[RPS Fake Lock Edit Error] {e}")
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    await message.author.send("🎭 **Stealth Lock Activated!** The game display now shows you've locked in your pick. Waiting for opponent...")
+                    return
+
+            rules_emb = discord.Embed(
+                title="📖 Rock Paper Scissors – Game Rules",
+                description="Each player secretly picks Rock, Paper, or Scissors. Both picks reveal simultaneously!",
+                color=COLOR_INFO
+            )
+            rules_emb.add_field(name="🪨 ROCK", value="Beats ✂️ **Scissors**, loses to 📄 **Paper**", inline=True)
+            rules_emb.add_field(name="📄 PAPER", value="Beats 🪨 **Rock**, loses to ✂️ **Scissors**", inline=True)
+            rules_emb.add_field(name="✂️ SCISSORS", value="Beats 📄 **Paper**, loses to 🪨 **Rock**", inline=True)
+            rules_emb.set_footer(text="Challenge anyone using c!rps or /rps!")
+            await message.channel.send(embed=rules_emb)
             return
 
         if message.content.lower().startswith('c!rps'):
