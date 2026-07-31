@@ -199,13 +199,7 @@ class GameClient(discord.Client):
         
         sorted_players = sorted(guild_lb.items(), key=sort_key, reverse=True)
         
-        lb_emb = discord.Embed(
-            title="🏆 Coup Leaderboard",
-            description="Top players in this server ranked by wins",
-            color=COLOR_GOLD
-        )
-        
-        lb_text = ""
+        lb_text = "🏆 **Top players in this server ranked by wins**\n\n"
         medals = ["🥇", "🥈", "🥉"]
         
         for idx, (user_id_str, stats) in enumerate(sorted_players[:10]):
@@ -225,9 +219,16 @@ class GameClient(discord.Client):
             win_rate = (wins / total * 100) if total > 0 else 0.0
             
             lb_text += f"{medal} **{username}**\n"
-            lb_text += f"   W: **{wins}** • L: **{losses}** • WR: **{win_rate:.1f}%**\n\n"
+            lb_text += f"┗ W: **{wins}** • L: **{losses}** • WR: **{win_rate:.1f}%**\n\n"
         
-        lb_emb.add_field(name="Players", value=lb_text or "No players recorded yet.", inline=False)
+        if len(lb_text) > 4000:
+            lb_text = lb_text[:3990] + "\n..."
+
+        lb_emb = discord.Embed(
+            title="🏆 Coup Leaderboard",
+            description=lb_text,
+            color=COLOR_GOLD
+        )
         lb_emb.set_footer(text="Complete a full game to record results.")
         return lb_emb
 

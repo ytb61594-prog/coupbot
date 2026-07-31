@@ -187,13 +187,7 @@ async def get_rps_leaderboard_embed(bot, guild_id: int):
 
     sorted_players = sorted(guild_data.items(), key=sort_key, reverse=True)
 
-    embed = discord.Embed(
-        title="⚔️ Rock Paper Scissors Leaderboard",
-        description="Server ELO Rating & Champion Standings",
-        color=COLOR_GOLD
-    )
-
-    lb_text = ""
+    lb_text = "🏆 **Server ELO Rating & Champion Standings**\n\n"
     medals = ["🥇", "🥈", "🥉"]
 
     for idx, (uid_str, stats) in enumerate(sorted_players[:10]):
@@ -217,12 +211,20 @@ async def get_rps_leaderboard_embed(bot, guild_id: int):
         total = wins + losses + ties
         win_rate = (wins / total * 100) if total > 0 else 0.0
 
-        streak_str = f"🔥 {streak} W" if streak > 0 else (f"❄️ {abs(streak)} L" if streak < 0 else "➖")
+        streak_str = f"🔥 {streak}W" if streak > 0 else (f"❄️ {abs(streak)}L" if streak < 0 else "➖")
 
         lb_text += f"{rank_num} **{username}** • {tier_emoji} **{rating}** ELO ({tier_name})\n"
-        lb_text += f"   W: **{wins}** • L: **{losses}** • T: **{ties}** • WR: **{win_rate:.1f}%** • Streak: {streak_str}\n\n"
+        lb_text += f"┗ W: **{wins}** • L: **{losses}** • T: **{ties}** • WR: **{win_rate:.1f}%** • {streak_str}\n\n"
 
-    embed.add_field(name="Top RPS Duellists", value=lb_text or "No active players yet.", inline=False)
+    # Truncate at 4000 characters to stay safely below Discord description limit (4096 chars)
+    if len(lb_text) > 4000:
+        lb_text = lb_text[:3990] + "\n..."
+
+    embed = discord.Embed(
+        title="⚔️ Rock Paper Scissors Leaderboard",
+        description=lb_text or "No active players yet.",
+        color=COLOR_GOLD
+    )
     embed.set_footer(text="Play RPS with c!rps or /rps to climb the rankings!")
     return embed
 
